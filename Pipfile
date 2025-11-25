@@ -9,13 +9,12 @@ torch = "*"
 torchvision = "*"
 torchaudio = "*"
 tqdm = "*"
-
 # Optional dataset utilities
 # If using nuScenes, uncomment:
 nuscenes-devkit = "*"
-
 # If you want Waymo TFRecord reading, uncomment:
 # tensorflow = ">=2.10,<2.16"
+open3d = "*"
 
 [dev-packages]
 black = "*"
