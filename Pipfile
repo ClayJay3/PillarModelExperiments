@@ -1,0 +1,23 @@
+[[source]]
+name = "pypi"
+url = "https://pypi.org/simple"
+verify_ssl = true
+
+[packages]
+numpy = "*"
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
+tqdm = "*"
+
+# Optional dataset utilities
+# If using nuScenes, uncomment:
+nuscenes-devkit = "*"
+
+# If you want Waymo TFRecord reading, uncomment:
+# tensorflow = ">=2.10,<2.16"
+
+[dev-packages]
+black = "*"
+flake8 = "*"
+pytest = "*"
