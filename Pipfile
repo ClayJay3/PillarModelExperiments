@@ -15,6 +15,7 @@ nuscenes-devkit = "*"
 # If you want Waymo TFRecord reading, uncomment:
 # tensorflow = ">=2.10,<2.16"
 open3d = "*"
+spconv-cu121 = "*"
 
 [dev-packages]
 black = "*"

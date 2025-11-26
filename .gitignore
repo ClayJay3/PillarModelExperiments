@@ -1,2 +1,4 @@
 v1.0-mini
 *.tgz
+checkpoints/
+*.lock

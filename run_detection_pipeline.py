@@ -2,13 +2,13 @@
 """
 run_detection_pipeline.py
 
-Single-file 3D detection pipeline (PointPillars).
-DIAGNOSTIC VERSION: Includes deep logging to debug the '0% Recall' issue.
-FIXED: Visualization unpacking error (8 vs 7 values).
+Single-file 3D detection pipeline.
+MODEL: PillarNeXt Architecture Clone (Dense Implementation).
+Structure: PillarEncoder -> 4-Stage ResNet -> ASPP Neck -> Upsampling CenterHead.
 
 Usage:
   python run_detection_pipeline.py --mode train --dataset nuscenes \
-      --data_root ./v1.0-mini --nusc_version v1.0-mini --epochs 30
+      --data_root ./v1.0-mini --nusc_version v1.0-mini --epochs 40
 
   python run_detection_pipeline.py --mode infer --dataset nuscenes \
       --data_root ./v1.0-mini --nusc_version v1.0-mini --checkpoint ./checkpoints/best.pth --evaluate --visualize
@@ -30,10 +30,10 @@ CONFIG = {
     'x_range': (-51.2, 51.2),
     'y_range': (-51.2, 51.2),
     'z_range': (-5.0, 3.0),
-    'grid_size': 0.16,  # 0.16m grid -> 640x640 input
-    'batch_size': 2,    # Small batch for GPU memory
+    'grid_size': 0.16,  # 640x640 input
+    'batch_size': 2,
     'num_workers': 4,
-    'lr': 0.003,
+    'lr': 0.001, # Lower learning rate for deeper network
     'weight_decay': 0.01,
 }
 
@@ -46,27 +46,21 @@ def seed_everything(seed=42):
 
 def mkdir(path): os.makedirs(path, exist_ok=True)
 
-# --- Visualization Helper ---
+# --- Visualizer ---
 def get_box_lineset(box, color):
     import open3d as o3d
-    # Ensure we only take the first 7 elements (geom) and ignore class ID if present
     x, y, z, l, w, h, yaw = box[:7]
-    
     x_corners = [l/2, l/2, -l/2, -l/2, l/2, l/2, -l/2, -l/2]
     y_corners = [w/2, -w/2, -w/2, w/2, w/2, -w/2, -w/2, w/2]
     z_corners = [h/2, h/2, h/2, h/2, -h/2, -h/2, -h/2, -h/2]
-    
-    c = np.cos(yaw)
-    s = np.sin(yaw)
+    c, s = np.cos(yaw), np.sin(yaw)
     R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-    
     corners_3d = np.vstack([x_corners, y_corners, z_corners])
     corners_3d = np.dot(R, corners_3d)
     corners_3d[0, :] += x
     corners_3d[1, :] += y
     corners_3d[2, :] += z
     corners_3d = corners_3d.T
-    
     lines = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]]
     line_set = o3d.geometry.LineSet()
     line_set.points = o3d.utility.Vector3dVector(corners_3d)
@@ -76,37 +70,19 @@ def get_box_lineset(box, color):
 
 def visualize_sample(points, gt_boxes, pred_boxes):
     import open3d as o3d
-    geometries = []
-    
-    # 1. Point Cloud
+    geoms = []
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points[:, :3])
-    # Color gray
     pcd.colors = o3d.utility.Vector3dVector(np.tile([0.5, 0.5, 0.5], (points.shape[0], 1)))
-    geometries.append(pcd)
-    
-    # 2. Ground Truth (Black)
-    for box in gt_boxes:
-        geometries.append(get_box_lineset(box, [0, 0, 0]))
-        
-    # 3. Predictions (Red)
-    for box in pred_boxes:
-        geometries.append(get_box_lineset(box, [1, 0, 0]))
-    
-    # 4. Canvas Boundary (Blue)
+    geoms.append(pcd)
+    for box in gt_boxes: geoms.append(get_box_lineset(box, [0, 0, 0]))
+    for box in pred_boxes: geoms.append(get_box_lineset(box, [1, 0, 0]))
     xr, yr, zr = CONFIG['x_range'], CONFIG['y_range'], CONFIG['z_range']
     l, w, h = xr[1]-xr[0], yr[1]-yr[0], zr[1]-zr[0]
-    # Box format for viz: center_x, center_y, center_z, l, w, h, yaw
-    boundary_box = [(xr[0]+xr[1])/2, (yr[0]+yr[1])/2, (zr[0]+zr[1])/2, l, w, h, 0]
-    geometries.append(get_box_lineset(boundary_box, [0, 0, 1]))
-    
-    # Add coordinate frame
-    geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0,0,0]))
+    geoms.append(get_box_lineset([(xr[0]+xr[1])/2, (yr[0]+yr[1])/2, (zr[0]+zr[1])/2, l, w, h, 0], [0, 0, 1]))
+    o3d.visualization.draw_geometries(geoms, window_name="PillarNeXt Clone")
 
-    print("Visualizing... (Close window to see next sample)")
-    o3d.visualization.draw_geometries(geometries, window_name="Pillar Detection Viz")
-
-# --- Dataset (NuScenes) ---
+# --- Dataset ---
 try:
     from nuscenes.nuscenes import NuScenes
     from nuscenes.utils.data_classes import LidarPointCloud
@@ -131,7 +107,6 @@ class NuScenesDataset(Dataset):
         token = self.sample_tokens[idx]
         sample = self.nusc.get('sample', token)
         lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
-        
         pc_path = os.path.join(self.nusc.dataroot, lidar_data['filename'])
         pc = LidarPointCloud.from_file(pc_path)
         pts = pc.points[:4, :].T.astype(np.float32)
@@ -149,7 +124,6 @@ class NuScenesDataset(Dataset):
             ann = self.nusc.get('sample_annotation', ann_t)
             cls_id = self._map_class(ann['category_name'])
             if cls_id is None: continue
-            
             box_glob = np.array(ann['translation'])
             box_ego = q_pose_inv.rotate(box_glob - t_pose)
             box_sens = q_cs_inv.rotate(box_ego - t_cs)
@@ -157,10 +131,10 @@ class NuScenesDataset(Dataset):
             yaw, _, _ = (q_cs_inv * q_pose_inv * q_box).yaw_pitch_roll
             l, w, h = ann['size'][1], ann['size'][0], ann['size'][2]
             
+            # Filter range
             if (box_sens[0] < CONFIG['x_range'][0] or box_sens[0] > CONFIG['x_range'][1] or 
                 box_sens[1] < CONFIG['y_range'][0] or box_sens[1] > CONFIG['y_range'][1]):
                 continue 
-                
             boxes.append([box_sens[0], box_sens[1], box_sens[2], l, w, h, yaw, int(cls_id)])
             
         boxes = np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 8), dtype=np.float32)
@@ -185,7 +159,7 @@ class NuScenesDataset(Dataset):
 
 def collate_fn(batch): return batch
 
-# --- Model Components ---
+# --- Model: PillarNeXt Clone ---
 
 class PillarEncoder(nn.Module):
     def __init__(self, out_c=64):
@@ -226,42 +200,128 @@ class PillarEncoder(nn.Module):
             batch_grids.append(grid.view(64, self.ny, self.nx))
         return torch.stack(batch_grids)
 
-class Backbone(nn.Module):
+class BasicBlock(nn.Module):
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_c, out_c, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_c)
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_c)
+        self.downsample = None
+        if stride != 1 or in_c != out_c:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_c, out_c, 1, stride, bias=False), nn.BatchNorm2d(out_c))
+    def forward(self, x):
+        ident = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        if self.downsample is not None: ident = self.downsample(x)
+        return F.relu(out + ident)
+
+class PillarNeXtBackbone(nn.Module):
+    """
+    Matches diagram: 4 Stages of Residual Blocks
+    """
     def __init__(self):
         super().__init__()
-        self.block1 = nn.Sequential(nn.Conv2d(64, 64, 3, 1, 1, bias=False), nn.BatchNorm2d(64), nn.ReLU(),
-                                    nn.Conv2d(64, 64, 3, 1, 1, bias=False), nn.BatchNorm2d(64), nn.ReLU())
-        self.block2 = nn.Sequential(nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU(),
-                                    nn.Conv2d(128, 128, 3, 1, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU())
-        self.block3 = nn.Sequential(nn.Conv2d(128, 256, 3, 2, 1, bias=False), nn.BatchNorm2d(256), nn.ReLU(),
-                                    nn.Conv2d(256, 256, 3, 1, 1, bias=False), nn.BatchNorm2d(256), nn.ReLU())
-        self.up1 = nn.Sequential(nn.ConvTranspose2d(64, 128, 1, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU())
-        self.up2 = nn.Sequential(nn.ConvTranspose2d(128, 128, 2, 2, bias=False), nn.BatchNorm2d(128), nn.ReLU())
-        self.up3 = nn.Sequential(nn.ConvTranspose2d(256, 128, 4, 4, bias=False), nn.BatchNorm2d(128), nn.ReLU())
-        self.out_c = 128 + 128 + 128
+        # Stage 1: H, W, C (Stride 1)
+        self.stage1 = nn.Sequential(
+            BasicBlock(64, 64, stride=1),
+            BasicBlock(64, 64, stride=1)
+        )
+        # Stage 2: H/2, W/2, 2C (Stride 2)
+        self.stage2 = nn.Sequential(
+            BasicBlock(64, 128, stride=2),
+            BasicBlock(128, 128, stride=1)
+        )
+        # Stage 3: H/4, W/4, 4C (Stride 2)
+        self.stage3 = nn.Sequential(
+            BasicBlock(128, 256, stride=2),
+            BasicBlock(256, 256, stride=1)
+        )
+        # Stage 4: H/8, W/8, 4C (Stride 2) - Note diagram says 4C, typically doubles, we'll use 512
+        self.stage4 = nn.Sequential(
+            BasicBlock(256, 512, stride=2),
+            BasicBlock(512, 512, stride=1)
+        )
+        self.out_c = 512
 
     def forward(self, x):
-        x1 = self.block1(x)
-        x2 = self.block2(x1)
-        x3 = self.block3(x2)
-        return torch.cat([self.up1(x1), self.up2(x2), self.up3(x3)], dim=1)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        return x
 
-class DetectionHead(nn.Module):
+class ASPP(nn.Module):
+    """
+    Matches diagram: Parallel convolutions with different dilations
+    """
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        # Dilation rates from diagram: 6, 12, 18
+        self.conv1 = nn.Sequential(nn.Conv2d(in_c, in_c, 1, bias=False), nn.BatchNorm2d(in_c), nn.ReLU())
+        self.conv2 = nn.Sequential(nn.Conv2d(in_c, in_c, 3, padding=6, dilation=6, bias=False), nn.BatchNorm2d(in_c), nn.ReLU())
+        self.conv3 = nn.Sequential(nn.Conv2d(in_c, in_c, 3, padding=12, dilation=12, bias=False), nn.BatchNorm2d(in_c), nn.ReLU())
+        self.conv4 = nn.Sequential(nn.Conv2d(in_c, in_c, 3, padding=18, dilation=18, bias=False), nn.BatchNorm2d(in_c), nn.ReLU())
+        
+        # Concat -> Reduce
+        self.project = nn.Sequential(
+            nn.Conv2d(in_c * 4, out_c, 1, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+        out = torch.cat([x1, x2, x3, x4], dim=1)
+        return self.project(out)
+
+class UpsamplingHead(nn.Module):
+    """
+    Matches diagram: Deconv -> Final Heads
+    """
     def __init__(self, in_c, n_classes=1):
         super().__init__()
-        self.conv_cls = nn.Conv2d(in_c, n_classes, 1)
-        self.conv_reg = nn.Conv2d(in_c, 8, 1)
+        # Diagram shows Deconv to upsample. 
+        # Input is H/8. We want at least H/4 or H/2 for detection.
+        # Let's upsample x2 to get H/4 resolution.
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(in_c, 256, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU()
+        )
+        
+        # Task Heads
+        self.conv_cls = nn.Conv2d(256, n_classes, 1)
+        self.conv_reg = nn.Conv2d(256, 8, 1)
+        
         self.conv_cls.bias.data.fill_(-4.6)
+
     def forward(self, x):
+        x = self.up(x)
         return torch.sigmoid(self.conv_cls(x)), self.conv_reg(x)
 
-class PointPillars(nn.Module):
+class PillarNeXtClone(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = PillarEncoder()
-        self.backbone = Backbone()
-        self.head = DetectionHead(self.backbone.out_c)
-    def forward(self, x): return self.head(self.backbone(self.encoder(x)))
+        self.backbone = PillarNeXtBackbone() # 4-Stage ResNet
+        self.neck = ASPP(self.backbone.out_c, 256) # ASPP
+        self.head = UpsamplingHead(256) # Deconv Head
+        
+        # Calculate total stride:
+        # Encoder (1) -> Stage 1 (1) -> Stage 2 (2) -> Stage 3 (4) -> Stage 4 (8) -> ASPP (8) -> Head Up (4)
+        self.stride = 4 
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.backbone(x)
+        x = self.neck(x)
+        return self.head(x)
 
 # --- Loss & Targets ---
 
@@ -290,7 +350,11 @@ def build_targets(gt_boxes, feature_shape, device):
     hm = torch.zeros(B, 1, H, W, device=device)
     reg = torch.zeros(B, 8, H, W, device=device)
     mask = torch.zeros(B, 1, H, W, device=device)
-    grid_size = CONFIG['grid_size'] 
+    
+    # Effective stride is 4 (0.16 * 4 = 0.64m resolution)
+    stride = 4
+    grid_size = CONFIG['grid_size'] * stride
+    
     for b in range(B):
         for box in gt_boxes[b]:
             x, y, z, l, w, h, yaw, cls = box
@@ -321,7 +385,7 @@ def compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask):
     loss_reg = F.l1_loss(pred_reg[mask], gt_reg[mask], reduction='sum') / max(1, pos_inds.sum())
     return loss_cls + 2.0 * loss_reg
 
-# --- Main Loop ---
+# --- Training ---
 
 def train(model, loader, opt, scaler, epoch):
     model.train()
@@ -333,9 +397,7 @@ def train(model, loader, opt, scaler, epoch):
             loss = compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask)
         
         if torch.isnan(loss):
-            print("WARNING: NaN Loss detected, skipping step")
-            opt.zero_grad()
-            continue
+            opt.zero_grad(); continue
 
         opt.zero_grad()
         scaler.scale(loss).backward()
@@ -351,9 +413,11 @@ def train(model, loader, opt, scaler, epoch):
 @torch.no_grad()
 def decode_predictions(pred_cls, pred_reg):
     B, _, H, W = pred_cls.shape
+    stride = 4
+    grid_size = CONFIG['grid_size'] * stride
+    
     nms_kernel = 3
-    pad = (nms_kernel - 1) // 2
-    hmax = F.max_pool2d(pred_cls, (nms_kernel, nms_kernel), stride=1, padding=pad)
+    hmax = F.max_pool2d(pred_cls, (nms_kernel, nms_kernel), stride=1, padding=(nms_kernel-1)//2)
     keep = (hmax == pred_cls).float()
     pred_cls = pred_cls * keep
     
@@ -367,8 +431,8 @@ def decode_predictions(pred_cls, pred_reg):
             idx = topk_inds[i]
             iy, ix = (idx // W).long(), (idx % W).long()
             reg = pred_reg[b, :, iy, ix]
-            cx = (ix + reg[0]) * CONFIG['grid_size'] + CONFIG['x_range'][0]
-            cy = (iy + reg[1]) * CONFIG['grid_size'] + CONFIG['y_range'][0]
+            cx = (ix + reg[0]) * grid_size + CONFIG['x_range'][0]
+            cy = (iy + reg[1]) * grid_size + CONFIG['y_range'][0]
             cz = reg[2]
             l, w, h = torch.exp(reg[3]), torch.exp(reg[4]), torch.exp(reg[5])
             yaw = torch.atan2(reg[6], reg[7])
@@ -404,7 +468,7 @@ def main():
     parser.add_argument('--dataset', default='nuscenes')
     parser.add_argument('--data_root', default='./v1.0-mini')
     parser.add_argument('--nusc_version', default='v1.0-mini')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--checkpoint', default=None)
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--visualize', action='store_true')
@@ -420,7 +484,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4)
     
-    model = PointPillars().to(device)
+    model = PillarNeXtClone().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
     scaler = GradScaler('cuda')
     
@@ -435,14 +499,13 @@ def main():
         for ep in range(start_epoch, args.epochs + 1):
             loss = train(model, train_loader, opt, scaler, ep)
             torch.save({'model': model.state_dict()}, './checkpoints/ckpt_last.pth')
-            if ep % 5 == 0 or ep > 20:
+            if ep % 5 == 0 or ep > 25:
                 rec, prec, f1 = evaluate(model, val_loader)
                 print(f"Epoch {ep} >> R: {rec*100:.2f} | P: {prec*100:.2f} | F1: {f1*100:.2f}")
                 if f1 > best_f1:
                     best_f1 = f1
                     torch.save({'model': model.state_dict()}, './checkpoints/best.pth')
                     print("Saved Best!")
-    
     elif args.mode == 'infer':
         if args.visualize:
             viz_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
