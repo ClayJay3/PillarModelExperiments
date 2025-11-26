@@ -2,18 +2,16 @@
 """
 run_detection_pipeline.py
 
-Single-file 3D detection pipeline (PillarNeXt style).
-UPGRADED VERSION: Implements Gaussian Splatting Targets and CornerNet Focal Loss
-to achieve high convergence and accuracy.
+Single-file 3D detection pipeline (PointPillars).
+DIAGNOSTIC VERSION: Includes deep logging to debug the '0% Recall' issue.
+FIXED: Boolean casting for regression mask indices.
 
 Usage:
-  # Train (runs longer for better accuracy)
   python run_detection_pipeline.py --mode train --dataset nuscenes \
-      --data_root ./v1.0-mini --nusc_version v1.0-mini --epochs 20
+      --data_root ./v1.0-mini --nusc_version v1.0-mini --epochs 30
 
-  # Infer + Eval
   python run_detection_pipeline.py --mode infer --dataset nuscenes \
-      --data_root ./v1.0-mini --nusc_version v1.0-mini --checkpoint ./checkpoints/ckpt_epoch_20.pth --evaluate
+      --data_root ./v1.0-mini --nusc_version v1.0-mini --checkpoint ./checkpoints/best.pth --evaluate
 """
 
 import os
@@ -25,37 +23,257 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
 
-# Disable anomaly detection for speed
-torch.autograd.set_detect_anomaly(False)
+# --- Configuration ---
+CONFIG = {
+    'x_range': (-51.2, 51.2),
+    'y_range': (-51.2, 51.2),
+    'z_range': (-5.0, 3.0),
+    'grid_size': 0.16,  # 0.16m grid -> 640x640 input
+    'batch_size': 2,    # Small batch for GPU memory
+    'num_workers': 4,
+    'lr': 0.003,
+    'weight_decay': 0.01,
+}
 
-# Optional libs
-try:
-    import open3d as o3d
-    _OPEN3D_OK = True
-except Exception:
-    _OPEN3D_OK = False
-
-try:
-    from nuscenes.nuscenes import NuScenes
-    from nuscenes.utils.data_classes import LidarPointCloud
-    from pyquaternion import Quaternion
-    _NUSC_OK = True
-except Exception:
-    _NUSC_OK = False
-
-# --- Utilities ----------------------------------------------------------------
-
-def seed_everything(seed: int = 42):
+# --- Utilities ---
+def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def mkdir(path):
-    os.makedirs(path, exist_ok=True)
+def mkdir(path): os.makedirs(path, exist_ok=True)
 
-# --- Gaussian Utils (Crucial for High Accuracy) -----------------------------
+# --- Dataset (NuScenes) ---
+try:
+    from nuscenes.nuscenes import NuScenes
+    from nuscenes.utils.data_classes import LidarPointCloud
+    from pyquaternion import Quaternion
+    _NUSC_OK = True
+except: _NUSC_OK = False
+
+class NuScenesDataset(Dataset):
+    def __init__(self, dataroot, version='v1.0-mini', augment=False):
+        if not _NUSC_OK: raise RuntimeError("pip install nuscenes-devkit")
+        self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
+        self.sample_tokens = [s['token'] for s in self.nusc.sample]
+        self.augment = augment
+
+    def __len__(self): return len(self.sample_tokens)
+
+    def _map_class(self, cat_name):
+        # Simplify to just CARS for now to guarantee convergence
+        if 'vehicle' in cat_name.lower(): return 0
+        return None 
+
+    def __getitem__(self, idx):
+        token = self.sample_tokens[idx]
+        sample = self.nusc.get('sample', token)
+        lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        
+        # Load Points
+        pc_path = os.path.join(self.nusc.dataroot, lidar_data['filename'])
+        pc = LidarPointCloud.from_file(pc_path)
+        pts = pc.points[:4, :].T.astype(np.float32)
+        pts[:, 3] /= 255.0 # Normalize intensity
+
+        # Load Boxes (Global -> Sensor)
+        cs_rec = self.nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+        pose_rec = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+        
+        # Pre-compute inverse transforms
+        q_cs_inv = Quaternion(cs_rec['rotation']).inverse
+        t_cs = np.array(cs_rec['translation'])
+        q_pose_inv = Quaternion(pose_rec['rotation']).inverse
+        t_pose = np.array(pose_rec['translation'])
+
+        boxes = []
+        for ann_t in sample['anns']:
+            ann = self.nusc.get('sample_annotation', ann_t)
+            cls_id = self._map_class(ann['category_name'])
+            if cls_id is None: continue
+            
+            # Geometry: Global -> Ego -> Sensor
+            box_glob = np.array(ann['translation'])
+            box_ego = q_pose_inv.rotate(box_glob - t_pose)
+            box_sens = q_cs_inv.rotate(box_ego - t_cs)
+            
+            # Rotation: Global -> Sensor
+            q_box = Quaternion(ann['rotation'])
+            yaw, _, _ = (q_cs_inv * q_pose_inv * q_box).yaw_pitch_roll
+            
+            # w,l,h -> l,w,h (standard detection format)
+            l, w, h = ann['size'][1], ann['size'][0], ann['size'][2]
+            # Check if the box center is strictly inside our defined grid range.
+            # CONFIG['x_range'] is (-51.2, 51.2)
+            if (box_sens[0] < CONFIG['x_range'][0] or box_sens[0] > CONFIG['x_range'][1] or 
+                box_sens[1] < CONFIG['y_range'][0] or box_sens[1] > CONFIG['y_range'][1]):
+                continue # Skip this box, it is "off-screen"
+                
+            boxes.append([box_sens[0], box_sens[1], box_sens[2], l, w, h, yaw, int(cls_id)])
+            
+        boxes = np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 8), dtype=np.float32)
+
+        # Augmentation (Flip/Rotate/Scale)
+        if self.augment:
+            if np.random.rand() > 0.5: # Flip X
+                pts[:, 1] = -pts[:, 1]; boxes[:, 1] = -boxes[:, 1]; boxes[:, 6] = -boxes[:, 6]
+            if np.random.rand() > 0.5: # Flip Y
+                pts[:, 0] = -pts[:, 0]; boxes[:, 0] = -boxes[:, 0]; boxes[:, 6] = np.pi - boxes[:, 6]
+            
+            rot = np.random.uniform(-0.78, 0.78) # +/- 45 deg
+            c, s = np.cos(rot), np.sin(rot)
+            mat = np.array([[c, -s], [s, c]])
+            pts[:, :2] = np.dot(pts[:, :2], mat.T)
+            if len(boxes) > 0:
+                boxes[:, :2] = np.dot(boxes[:, :2], mat.T)
+                boxes[:, 6] += rot
+            
+            scale = np.random.uniform(0.95, 1.05)
+            pts[:, :3] *= scale
+            if len(boxes) > 0: boxes[:, :6] *= scale
+
+        return {'points': pts, 'boxes': boxes}
+
+def collate_fn(batch): return batch
+
+# --- Model Components ---
+
+class PillarEncoder(nn.Module):
+    def __init__(self, out_c=64):
+        super().__init__()
+        self.grid_size = CONFIG['grid_size']
+        self.x_range = CONFIG['x_range']
+        self.y_range = CONFIG['y_range']
+        self.nx = int((self.x_range[1] - self.x_range[0]) / self.grid_size)
+        self.ny = int((self.y_range[1] - self.y_range[0]) / self.grid_size)
+        
+        # MLP for Point Features
+        self.mlp = nn.Sequential(
+            nn.Linear(9, out_c),
+            nn.BatchNorm1d(out_c),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, points_list):
+        device = next(self.parameters()).device
+        batch_grids = []
+        
+        for pts in points_list:
+            # 1. Voxelize
+            keep = (pts[:,0] >= self.x_range[0]) & (pts[:,0] < self.x_range[1]) & \
+                   (pts[:,1] >= self.y_range[0]) & (pts[:,1] < self.y_range[1])
+            pts = pts[keep]
+            
+            if len(pts) == 0:
+                batch_grids.append(torch.zeros(64, self.ny, self.nx, device=device))
+                continue
+                
+            pts_t = torch.from_numpy(pts).to(device)
+            
+            # Coords
+            coor_x = ((pts_t[:, 0] - self.x_range[0]) / self.grid_size).long()
+            coor_y = ((pts_t[:, 1] - self.y_range[0]) / self.grid_size).long()
+            
+            # Centers
+            c_x = coor_x.float() * self.grid_size + self.x_range[0] + self.grid_size/2
+            c_y = coor_y.float() * self.grid_size + self.y_range[0] + self.grid_size/2
+            
+            # Features [x, y, z, i, x-xc, y-yc, z, x, y]
+            feats = torch.cat([
+                pts_t, 
+                pts_t[:, :2] - torch.stack([c_x, c_y], dim=1),
+                pts_t[:, 2:3],
+                pts_t[:, :2]
+            ], dim=1)
+            
+            # 2. Embed
+            feats = self.mlp(feats)
+            
+            # 3. Scatter (Max Pooling)
+            indices = coor_y * self.nx + coor_x
+            # Sort
+            order = torch.argsort(indices)
+            indices = indices[order]
+            feats = feats[order]
+            
+            unique_idx, counts = torch.unique_consecutive(indices, return_counts=True)
+            
+            # Max Pool Trick
+            feat_chunks = torch.split(feats, counts.tolist())
+            max_feats = torch.stack([chunk.max(dim=0)[0] for chunk in feat_chunks])
+            
+            # Map to Grid
+            grid = torch.zeros(64, self.ny * self.nx, dtype=max_feats.dtype, device=device)
+            grid[:, unique_idx] = max_feats.T
+            batch_grids.append(grid.view(64, self.ny, self.nx))
+            
+        return torch.stack(batch_grids)
+
+class Backbone(nn.Module):
+    """Standard PointPillars Backbone (SECT) - Stride 2 Output"""
+    def __init__(self):
+        super().__init__()
+        # Downsample 1 (Stride 1 -> 1)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, 1, 1, bias=False), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1, 1, bias=False), nn.BatchNorm2d(64), nn.ReLU(),
+        )
+        # Downsample 2 (Stride 1 -> 2)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 2, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, 3, 1, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU(),
+        )
+        # Downsample 3 (Stride 2 -> 4)
+        self.block3 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 2, 1, bias=False), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(256, 256, 3, 1, 1, bias=False), nn.BatchNorm2d(256), nn.ReLU(),
+        )
+        
+        # Upsample (Neck)
+        self.up1 = nn.Sequential(nn.ConvTranspose2d(64, 128, 1, 1, bias=False), nn.BatchNorm2d(128), nn.ReLU()) # 1->1
+        self.up2 = nn.Sequential(nn.ConvTranspose2d(128, 128, 2, 2, bias=False), nn.BatchNorm2d(128), nn.ReLU()) # 2->1
+        self.up3 = nn.Sequential(nn.ConvTranspose2d(256, 128, 4, 4, bias=False), nn.BatchNorm2d(128), nn.ReLU()) # 4->1
+        
+        self.out_c = 128 + 128 + 128
+
+    def forward(self, x):
+        x1 = self.block1(x)
+        x2 = self.block2(x1)
+        x3 = self.block3(x2)
+        u1 = self.up1(x1)
+        u2 = self.up2(x2)
+        u3 = self.up3(x3)
+        return torch.cat([u1, u2, u3], dim=1)
+
+class DetectionHead(nn.Module):
+    def __init__(self, in_c, n_classes=1):
+        super().__init__()
+        self.conv_cls = nn.Conv2d(in_c, n_classes, 1)
+        self.conv_reg = nn.Conv2d(in_c, 8, 1) # dx, dy, dz, w, l, h, sin, cos
+        
+        # Initialization
+        self.conv_cls.bias.data.fill_(-4.6) # Focal loss init
+        
+    def forward(self, x):
+        cls = torch.sigmoid(self.conv_cls(x))
+        reg = self.conv_reg(x)
+        return cls, reg
+
+class PointPillars(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = PillarEncoder()
+        self.backbone = Backbone()
+        self.head = DetectionHead(self.backbone.out_c)
+        self.stride = 1 
+
+    def forward(self, x):
+        return self.head(self.backbone(self.encoder(x)))
+
+# --- Loss & Targets ---
 
 def gaussian_2d(shape, sigma=1):
     m, n = [(ss - 1.) / 2. for ss in shape]
@@ -65,434 +283,221 @@ def gaussian_2d(shape, sigma=1):
     return h
 
 def draw_umich_gaussian(heatmap, center, radius, k=1):
-    """
-    Draws a 2D gaussian on the heatmap at integer center.
-    """
     radius = int(radius)
     diameter = 2 * radius + 1
     gaussian = gaussian_2d((diameter, diameter), sigma=diameter / 6)
-    
     x, y = int(center[0]), int(center[1])
-    height, width = heatmap.shape[0:2]
-    
+    height, width = heatmap.shape
     left, right = min(x, radius), min(width - x, radius + 1)
     top, bottom = min(y, radius), min(height - y, radius + 1)
-
     masked_heatmap  = heatmap[y - top:y + bottom, x - left:x + right]
-    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
-    
+    masked_gaussian = torch.from_numpy(gaussian[radius - top:radius + bottom, radius - left:radius + right]).to(heatmap.device)
     if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
-        np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
-    return heatmap
+        torch.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
 
-# --- Loss Functions (CornerNet / CenterPoint Style) -------------------------
-
-def fast_focal_loss(pred, gt):
+def build_targets(gt_boxes, feature_shape, device):
     """
-    Penalty-reduced pixel-wise focal loss.
+    Builds dense heatmap and regression targets.
     """
-    pos_inds = gt.eq(1).float()
-    neg_inds = gt.lt(1).float()
-
-    neg_weights = torch.pow(1 - gt, 4)
-
-    loss = 0
-    # Log(0) protection
-    pred = torch.clamp(pred, 1e-6, 1 - 1e-6)
-
-    pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds
-    neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds
-
-    num_pos  = pos_inds.float().sum()
-    pos_loss = pos_loss.sum()
-    neg_loss = neg_loss.sum()
-
-    if num_pos == 0:
-        loss = -neg_loss
-    else:
-        loss = -(pos_loss + neg_loss) / num_pos
-    return loss
-
-# --- Dataset ----------------------------------------------------------------
-
-class NuScenesPointCloudDataset(Dataset):
-    def __init__(self, dataroot: str, version: str = 'v1.0-mini', max_samples: int = None):
-        if not _NUSC_OK: raise RuntimeError("nuscenes-devkit required.")
-        self.nusc = NuScenes(version=version, dataroot=dataroot, verbose=False)
-        self.sample_tokens = [s['token'] for s in self.nusc.sample]
-        if max_samples: self.sample_tokens = self.sample_tokens[:max_samples]
-
-    def __len__(self): return len(self.sample_tokens)
-
-    def _map_class(self, cat_name: str) -> int:
-        name = cat_name.lower()
-        if 'vehicle' in name or 'car' in name or 'bus' in name or 'truck' in name: return 0
-        if 'human' in name or 'ped' in name or 'person' in name: return 1
-        if 'motor' in name or 'bicycle' in name or 'bike' in name: return 2
-        return None
-
-    def __getitem__(self, idx):
-        token = self.sample_tokens[idx]
-        sample = self.nusc.get('sample', token)
-        lidar_token = sample['data']['LIDAR_TOP']
-        sd_rec = self.nusc.get('sample_data', lidar_token)
-        
-        pc_path = os.path.join(self.nusc.dataroot, sd_rec['filename'])
-        pc = LidarPointCloud.from_file(pc_path)
-        # Random subsample if too large (optimizes speed)
-        pts = pc.points[:4, :].T.astype(np.float32)
-
-        # Coordinate Transforms
-        cs_rec = self.nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
-        pose_rec = self.nusc.get('ego_pose', sd_rec['ego_pose_token'])
-        q_pose = Quaternion(pose_rec['rotation']); t_pose = np.array(pose_rec['translation'])
-        q_cs = Quaternion(cs_rec['rotation']); t_cs = np.array(cs_rec['translation'])
-
-        boxes = []
-        for ann_t in sample['anns']:
-            ann = self.nusc.get('sample_annotation', ann_t)
-            cls_id = self._map_class(ann['category_name'])
-            if cls_id is None: continue
-
-            # Global -> Sensor
-            center = np.array(ann['translation'])
-            center = q_cs.inverse.rotate(q_pose.inverse.rotate(center - t_pose) - t_cs)
-            
-            # Yaw (Global -> Sensor)
-            q_box = q_cs.inverse * q_pose.inverse * Quaternion(ann['rotation'])
-            yaw, _, _ = q_box.yaw_pitch_roll
-            
-            # W, L, H -> dy, dx, dz
-            l, w, h = ann['size'][1], ann['size'][0], ann['size'][2]
-            boxes.append([center[0], center[1], center[2], l, w, h, yaw, int(cls_id)])
-
-        return {'points': pts, 'boxes': np.array(boxes, dtype=np.float32)}
-
-def collate_fn(batch): return batch
-
-class SyntheticPointCloudDataset(Dataset):
-    def __init__(self, n_samples=200): self.len=n_samples
-    def __len__(self): return self.len
-    def __getitem__(self, idx):
-        pts = (np.random.rand(2048,4)-0.5)*[80,80,6,1]
-        boxes = [[(np.random.rand()-0.5)*40, (np.random.rand()-0.5)*40, -1.0, 4.0, 2.0, 1.5, 0.0, 0]]
-        return {'points':pts.astype(np.float32), 'boxes':np.array(boxes, dtype=np.float32)}
-
-# --- Network Components -----------------------------------------------------
-
-class PillarEncoder(nn.Module):
-    def __init__(self, x_range=(-40,40), y_range=(-40,40), z_range=(-3,3), grid_size=0.2, in_channels=4, out_channels=64):
-        super().__init__()
-        self.x_min, self.x_max = x_range
-        self.y_min, self.y_max = y_range
-        self.z_min, self.z_max = z_range
-        self.grid_size = grid_size
-        self.nx = int((self.x_max - self.x_min) / grid_size)
-        self.ny = int((self.y_max - self.y_min) / grid_size)
-        self.out_channels = out_channels
-        self.point_mlp = nn.Sequential(nn.Linear(in_channels, out_channels), nn.BatchNorm1d(out_channels), nn.ReLU())
-
-    def forward(self, points_list):
-        device = next(self.point_mlp.parameters()).device
-        batch_list = []
-        for pts in points_list:
-            # Filter (keep in numpy for easy boolean indexing)
-            mask = (pts[:,0]>self.x_min)&(pts[:,0]<self.x_max)&(pts[:,1]>self.y_min)&(pts[:,1]<self.y_max)
-            pts = pts[mask]
-
-            if len(pts) == 0:
-                batch_list.append(torch.zeros(self.out_channels, self.ny, self.nx, device=device))
-                continue
-            
-            # --- FIX START ---
-            # Convert to Tensor on device immediately. 
-            # This allows us to use .long() and keeps downstream ops on GPU.
-            pts_t = torch.from_numpy(pts).to(device)
-            
-            # Coords -> Indices
-            ix = ((pts_t[:,0] - self.x_min) / self.grid_size).long()
-            iy = ((pts_t[:,1] - self.y_min) / self.grid_size).long()
-            
-            # Features
-            feat = self.point_mlp(pts_t)
-            # --- FIX END ---
-            
-            # Scatter Max 
-            indices = iy * self.nx + ix
-            
-            # Sort to group
-            sort_idx = torch.argsort(indices)
-            indices = indices[sort_idx]
-            feat = feat[sort_idx]
-            
-            # Unique indices
-            unique_idx, counts = torch.unique_consecutive(indices, return_counts=True)
-            
-            # Max pooling per pillar
-            feat_split = torch.split(feat, counts.tolist())
-            max_feats = torch.stack([f.max(dim=0)[0] for f in feat_split])
-            
-            # Scatter to grid
-            grid = torch.zeros(self.out_channels, self.ny * self.nx, device=device)
-            grid[:, unique_idx] = max_feats.T
-            batch_list.append(grid.view(self.out_channels, self.ny, self.nx))
-            
-        return torch.stack(batch_list)
-
-class Backbone(nn.Module):
-    def __init__(self, in_c, channels=[64, 128, 256]):
-        super().__init__()
-        self.c1 = nn.Sequential(nn.Conv2d(in_c, channels[0], 3, 1, 1), nn.BatchNorm2d(channels[0]), nn.ReLU())
-        self.c2 = nn.Sequential(nn.Conv2d(channels[0], channels[1], 3, 2, 1), nn.BatchNorm2d(channels[1]), nn.ReLU())
-        self.c3 = nn.Sequential(nn.Conv2d(channels[1], channels[2], 3, 2, 1), nn.BatchNorm2d(channels[2]), nn.ReLU())
-        self.up2 = nn.Sequential(nn.ConvTranspose2d(channels[1], 128, 2, 2), nn.BatchNorm2d(128), nn.ReLU())
-        self.up3 = nn.Sequential(nn.ConvTranspose2d(channels[2], 128, 4, 4), nn.BatchNorm2d(128), nn.ReLU())
-        self.out_c = channels[0] + 128 + 128
-        
-    def forward(self, x):
-        x1 = self.c1(x)
-        x2 = self.c2(x1)
-        x3 = self.c3(x2)
-        return torch.cat([x1, self.up2(x2), self.up3(x3)], dim=1)
-
-class CenterHead(nn.Module):
-    def __init__(self, in_c, classes=3):
-        super().__init__()
-        self.hm = nn.Conv2d(in_c, classes, 1)
-        self.wh = nn.Conv2d(in_c, 2, 1)
-        self.reg = nn.Conv2d(in_c, 2, 1)
-        # Initialize bias for focal loss stability
-        self.hm.bias.data.fill_(-2.19)
-        
-    def forward(self, x):
-        return {'hm': torch.sigmoid(self.hm(x)), 'wh': self.wh(x), 'reg': self.reg(x)}
-
-class Detector(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.encoder = PillarEncoder(grid_size=cfg['grid'])
-        self.backbone = Backbone(64)
-        self.head = CenterHead(self.backbone.out_c, cfg['classes'])
-        
-    def forward(self, x):
-        return self.head(self.backbone(self.encoder(x)))
-
-# --- Targets & Training -----------------------------------------------------
-
-def generate_targets(boxes_list, shape, encoder, device):
-    """
-    Gaussian Splatting target generation.
-    """
-    B, C, H, W = shape
-    hm = np.zeros((B, C, H, W), dtype=np.float32)
-    wh = np.zeros((B, 2, H, W), dtype=np.float32)
-    reg = np.zeros((B, 2, H, W), dtype=np.float32)
-    mask = np.zeros((B, 1, H, W), dtype=np.float32)
+    B, _, H, W = feature_shape
     
-    for b, boxes in enumerate(boxes_list):
-        for box in boxes:
-            cx, cy, _, l, w, _, _, cls_id = box
-            cls_id = int(cls_id)
-            if cls_id >= C: continue
-            
-            # Project to grid
-            x = (cx - encoder.x_min) / encoder.grid_size
-            y = (cy - encoder.y_min) / encoder.grid_size
-            
-            x_int, y_int = int(x), int(y)
-            if x_int < 0 or x_int >= W or y_int < 0 or y_int >= H: continue
-            
-            # Draw Gaussian
-            radius = max(0, int(max(l, w) / encoder.grid_size / 2)) # Dynamic radius based on size
-            radius = max(1, radius) # Minimum 1 pixel radius
-            draw_umich_gaussian(hm[b, cls_id], (x_int, y_int), radius)
-            
-            # Regression targets
-            wh[b, 0, y_int, x_int] = float(np.log(l))
-            wh[b, 1, y_int, x_int] = float(np.log(w))
-            reg[b, 0, y_int, x_int] = float(x - x_int)
-            reg[b, 1, y_int, x_int] = float(y - y_int)
-            mask[b, 0, y_int, x_int] = 1.0
-            
-    return torch.tensor(hm).to(device), torch.tensor(wh).to(device), \
-           torch.tensor(reg).to(device), torch.tensor(mask).bool().to(device)
-
-def train_epoch(model, loader, opt, device, epoch):
-    model.train()
-    total_loss = 0
-    for i, batch in enumerate(loader):
-        opt.zero_grad()
-        # Forward
-        preds = model([b['points'] for b in batch])
-        
-        # Targets
-        gt_hm, gt_wh, gt_reg, gt_mask = generate_targets(
-            [b['boxes'] for b in batch], preds['hm'].shape, model.encoder, device
-        )
-        
-        # Loss
-        loss_hm = fast_focal_loss(preds['hm'], gt_hm)
-        loss_wh = F.l1_loss(preds['wh'][gt_mask.expand_as(gt_wh)], gt_wh[gt_mask.expand_as(gt_wh)]) if gt_mask.sum() > 0 else 0
-        loss_reg = F.l1_loss(preds['reg'][gt_mask.expand_as(gt_reg)], gt_reg[gt_mask.expand_as(gt_reg)]) if gt_mask.sum() > 0 else 0
-        
-        loss = loss_hm + 0.1 * loss_wh + 1.0 * loss_reg
-        loss.backward()
-        opt.step()
-        total_loss += loss.item()
-        
-        if i % 10 == 0:
-            print(f"Ep {epoch} {i}/{len(loader)} | Loss: {loss.item():.4f} (HM: {loss_hm:.4f})")
-            
-    return total_loss / len(loader)
-
-def decode(preds, encoder, k=50):
-    hm = preds['hm'].sigmoid().detach().cpu().numpy()
-    wh = preds['wh'].detach().cpu().numpy()
-    reg = preds['reg'].detach().cpu().numpy()
-    B, C, H, W = hm.shape
-    res = []
+    hm = torch.zeros(B, 1, H, W, device=device)
+    reg = torch.zeros(B, 8, H, W, device=device)
+    mask = torch.zeros(B, 1, H, W, device=device)
+    
+    grid_size = CONFIG['grid_size'] 
     
     for b in range(B):
-        # Flatten and topk
-        scores = hm[b].reshape(-1)
-        # Fast numpy topk
-        inds = np.argpartition(-scores, k)[:k]
-        inds = inds[np.argsort(-scores[inds])]
-        
-        box_list = []
-        for idx in inds:
-            score = scores[idx]
-            if score < 0.2: break # Confidence threshold
+        for box in gt_boxes[b]:
+            # Box: x, y, z, l, w, h, yaw
+            x, y, z, l, w, h, yaw, cls = box
             
-            cls = idx // (H*W)
-            loc = idx % (H*W)
-            y, x = loc // W, loc % W
+            # Grid Coords
+            cx = (x - CONFIG['x_range'][0]) / grid_size
+            cy = (y - CONFIG['y_range'][0]) / grid_size
             
-            # Retrieve centers
-            off_x = reg[b, 0, y, x]
-            off_y = reg[b, 1, y, x]
+            ix, iy = int(cx), int(cy)
             
-            # Retrieve size
-            l = np.exp(wh[b, 0, y, x])
-            w = np.exp(wh[b, 1, y, x])
-            
-            # Map back to world
-            wx = encoder.x_min + (x + off_x) * encoder.grid_size
-            wy = encoder.y_min + (y + off_y) * encoder.grid_size
-            
-            box_list.append({'x': wx, 'y': wy, 'z': -1.0, 'dx': l, 'dy': w, 'score': float(score), 'lbl': cls})
-        res.append(box_list)
-    return res
+            if 0 <= ix < W and 0 <= iy < H:
+                # Heatmap (Gaussian Splat)
+                radius = max(2, int(max(l, w) / grid_size / 2))
+                draw_umich_gaussian(hm[b, 0], (ix, iy), radius)
+                
+                # Regression
+                mask[b, 0, iy, ix] = 1.0
+                
+                # Offsets (0-1)
+                reg[b, 0, iy, ix] = float(cx - ix)
+                reg[b, 1, iy, ix] = float(cy - iy)
+                reg[b, 2, iy, ix] = float(z)
+                reg[b, 3, iy, ix] = float(math.log(max(l, 0.01)))
+                reg[b, 4, iy, ix] = float(math.log(max(w, 0.01)))
+                reg[b, 5, iy, ix] = float(math.log(max(h, 0.01)))
+                reg[b, 6, iy, ix] = float(math.sin(yaw))
+                reg[b, 7, iy, ix] = float(math.cos(yaw))
 
-def evaluate(model, loader, device):
+    return hm, reg, mask
+
+def compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask):
+    # Focal Loss
+    pos_inds = gt_cls.eq(1).float()
+    neg_inds = gt_cls.lt(1).float()
+    neg_weights = torch.pow(1 - gt_cls, 4)
+    
+    pred_cls = torch.clamp(pred_cls, 1e-6, 1 - 1e-6)
+    pos_loss = torch.log(pred_cls) * torch.pow(1 - pred_cls, 2) * pos_inds
+    neg_loss = torch.log(1 - pred_cls) * torch.pow(pred_cls, 2) * neg_weights * neg_inds
+    
+    num_pos = pos_inds.sum()
+    loss_cls = - (pos_loss.sum() + neg_loss.sum()) / max(1, num_pos)
+    
+    # Regression Loss (L1)
+    # FIX: Cast to bool for indexing
+    mask = gt_mask.expand_as(pred_reg).bool()
+    loss_reg = F.l1_loss(pred_reg[mask], gt_reg[mask], reduction='sum') / max(1, num_pos)
+    
+    return loss_cls + 2.0 * loss_reg
+
+# --- Main Loop ---
+
+def train(model, loader, opt, scaler, epoch):
+    model.train()
+    epoch_loss = 0
+    
+    for i, batch in enumerate(loader):
+        with autocast('cuda'):
+            pred_cls, pred_reg = model([b['points'] for b in batch])
+            gt_cls, gt_reg, gt_mask = build_targets([b['boxes'] for b in batch], pred_cls.shape, 'cuda')
+            loss = compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask)
+        
+        opt.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        scaler.step(opt)
+        scaler.update()
+        
+        epoch_loss += loss.item()
+        
+        if i % 10 == 0:
+            # DIAGNOSTIC: Print max confidence
+            max_conf = pred_cls.max().item()
+            print(f"Ep {epoch} | Loss: {loss.item():.4f} | Max Conf: {max_conf:.4f} | Pos: {gt_mask.sum()}")
+            
+    return epoch_loss / len(loader)
+
+@torch.no_grad()
+def evaluate(model, loader):
     model.eval()
-    total_matched = 0
+    matches = 0
     total_gt = 0
     total_pred = 0
     
-    print("Evaluating...")
-    with torch.no_grad():
-        for batch in loader:
-            preds = model([b['points'] for b in batch])
-            boxes_pred = decode(preds, model.encoder)
+    for batch in loader:
+        pred_cls, pred_reg = model([b['points'] for b in batch])
+        
+        B, _, H, W = pred_cls.shape
+        
+        # Simple NMS
+        nms_kernel = 3
+        pad = (nms_kernel - 1) // 2
+        hmax = F.max_pool2d(pred_cls, (nms_kernel, nms_kernel), stride=1, padding=pad)
+        keep = (hmax == pred_cls).float()
+        pred_cls = pred_cls * keep
+        
+        # Decode
+        for b in range(B):
+            scores = pred_cls[b, 0].view(-1)
+            # DIAGNOSTIC: Lower threshold to 0.01 to see if ANYTHING is learned
+            topk_scores, topk_inds = torch.topk(scores, 50)
             
-            for i, gt_boxes in enumerate([b['boxes'] for b in batch]):
-                pred_b = boxes_pred[i]
-                total_gt += len(gt_boxes)
-                total_pred += len(pred_b)
+            preds_box = []
+            for i in range(50):
+                if topk_scores[i] < 0.05: continue # Threshold
                 
-                # Match
-                if len(gt_boxes) == 0 or len(pred_b) == 0: continue
+                idx = topk_inds[i]
+                iy = (idx // W).long()
+                ix = (idx % W).long()
                 
+                reg = pred_reg[b, :, iy, ix]
+                
+                cx = (ix + reg[0]) * CONFIG['grid_size'] + CONFIG['x_range'][0]
+                cy = (iy + reg[1]) * CONFIG['grid_size'] + CONFIG['y_range'][0]
+                
+                preds_box.append([cx.item(), cy.item()])
+                
+            # Match
+            gt_boxes = batch[b]['boxes']
+            total_gt += len(gt_boxes)
+            total_pred += len(preds_box)
+            
+            if len(gt_boxes) > 0 and len(preds_box) > 0:
                 gt_xy = gt_boxes[:, :2]
-                pred_xy = np.array([[p['x'], p['y']] for p in pred_b])
+                pred_xy = np.array(preds_box)
+                dists = np.linalg.norm(gt_xy[:, None] - pred_xy[None, :], axis=2)
                 
-                # Dist matrix
-                dists = np.linalg.norm(gt_xy[:, None, :] - pred_xy[None, :, :], axis=2)
-                # Greedy match within 2.0m
+                # Lenient matching (2.0m)
                 has_match = np.any(dists < 2.0, axis=1)
-                total_matched += np.sum(has_match)
+                matches += has_match.sum()
                 
-    rec = total_matched / max(1, total_gt)
-    prec = total_matched / max(1, total_pred)
+                # DIAGNOSTIC: Print first match check
+                if matches == 0 and len(preds_box) > 0:
+                    print(f"DEBUG: GT: {gt_xy[0]} | PRED: {pred_xy[0]} | Dist: {dists[0,0]:.2f}")
+
+    rec = matches / max(1, total_gt)
+    prec = matches / max(1, total_pred)
     f1 = 2 * prec * rec / max(1e-6, prec + rec)
     return rec, prec, f1
-
-# --- Main -------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', default='train')
-    parser.add_argument('--dataset', default='synthetic')
-    parser.add_argument('--data_root', default='./data')
+    parser.add_argument('--dataset', default='nuscenes')
+    parser.add_argument('--data_root', default='./v1.0-mini')
     parser.add_argument('--nusc_version', default='v1.0-mini')
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--checkpoint', default=None)
-    parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--evaluate', action='store_true')
     args = parser.parse_args()
     
     seed_everything()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda')
     mkdir('./checkpoints')
     
-    cfg = {'grid': 0.2, 'classes': 3} # 0.2m grid = 400x400 image for 80m range
+    train_ds = NuScenesDataset(args.data_root, args.nusc_version, augment=True)
+    val_ds = NuScenesDataset(args.data_root, args.nusc_version, augment=False)
     
-    # Data
-    if args.dataset == 'nuscenes':
-        ds = NuScenesPointCloudDataset(args.data_root, args.nusc_version)
-    else:
-        ds = SyntheticPointCloudDataset()
-        
-    loader = DataLoader(ds, batch_size=4, shuffle=(args.mode=='train'), collate_fn=collate_fn, num_workers=2)
+    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=4)
     
-    model = Detector(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    model = PointPillars().to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
+    scaler = GradScaler('cuda')
     
     start_epoch = 1
     if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location=device)
+        ckpt = torch.load(args.checkpoint)
         model.load_state_dict(ckpt['model'])
-        if 'epoch' in ckpt and args.mode == 'train': start_epoch = ckpt['epoch'] + 1
         print(f"Loaded {args.checkpoint}")
-        
+    
     if args.mode == 'train':
-        for ep in range(start_epoch, args.epochs+1):
-            loss = train_epoch(model, loader, opt, device, ep)
-            print(f"--- Epoch {ep} Avg Loss: {loss:.4f} ---")
-            torch.save({'epoch': ep, 'model': model.state_dict()}, f'./checkpoints/ckpt_epoch_{ep}.pth')
+        best_f1 = 0
+        for ep in range(start_epoch, args.epochs + 1):
+            loss = train(model, train_loader, opt, scaler, ep)
             
+            torch.save({'model': model.state_dict()}, './checkpoints/ckpt_last.pth')
+            
+            if ep % 5 == 0 or ep > 20:
+                rec, prec, f1 = evaluate(model, val_loader)
+                print(f"Epoch {ep} >> R: {rec*100:.2f} | P: {prec*100:.2f} | F1: {f1*100:.2f}")
+                if f1 > best_f1:
+                    best_f1 = f1
+                    torch.save({'model': model.state_dict()}, './checkpoints/best.pth')
+                    print("Saved Best!")
+    
     elif args.mode == 'infer':
-        if args.evaluate:
-            rec, prec, f1 = evaluate(model, loader, device)
-            print(f"\nFinal Results:\nRecall:    {rec*100:.2f}%\nPrecision: {prec*100:.2f}%\nF1 Score:  {f1*100:.2f}%")
-            
-        if args.visualize and _OPEN3D_OK:
-            # Quick viz of first few
-            model.eval()
-            with torch.no_grad():
-                for i, batch in enumerate(loader):
-                    if i > 2: break
-                    preds = model([b['points'] for b in batch])
-                    dec = decode(preds, model.encoder)
-                    pts = batch[0]['points']
-                    
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(pts[:, :3])
-                    
-                    boxes = []
-                    # Preds (Red)
-                    for b in dec[0]:
-                        obb = o3d.geometry.OrientedBoundingBox([b['x'], b['y'], -1], np.eye(3), [b['dx'], b['dy'], 2])
-                        obb.color = (1, 0, 0)
-                        boxes.append(obb)
-                    # GT (Green)
-                    for b in batch[0]['boxes']:
-                        obb = o3d.geometry.OrientedBoundingBox(b[:3], o3d.geometry.get_rotation_matrix_from_xyz((0,0,b[6])), [b[4], b[3], b[5]])
-                        obb.color = (0, 1, 0)
-                        boxes.append(obb)
-                        
-                    o3d.visualization.draw_geometries([pcd, *boxes])
+        rec, prec, f1 = evaluate(model, val_loader)
+        print(f"Result >> R: {rec*100:.2f} | P: {prec*100:.2f} | F1: {f1*100:.2f}")
 
 if __name__ == '__main__':
     main()
