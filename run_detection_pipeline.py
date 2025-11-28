@@ -500,9 +500,12 @@ class UpsamplingHead(nn.Module):
     def __init__(self, in_c, n_classes=1):
         super().__init__()
         self.up = nn.Sequential(
-            nn.ConvTranspose2d(in_c, 128, kernel_size=2, stride=2, bias=False),
+            nn.ConvTranspose2d(in_c, 256, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU()
         )
+        self.dropout = nn.Dropout(p=0.3)
         self.conv_cls = nn.Conv2d(128, n_classes, 1)
         self.conv_reg = nn.Conv2d(128, 8, 1)
         self.conv_cls.bias.data.fill_(-4.6) # Initialize bias to prevent instability
