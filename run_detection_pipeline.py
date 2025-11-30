@@ -598,7 +598,10 @@ def compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask):
 
 @torch.no_grad()
 def decode_predictions(pred_cls, pred_reg):
-    """Decodes heatmaps into 3D Bounding Boxes."""
+    """
+    Decodes heatmaps into 3D Bounding Boxes.
+    Returns: List of boxes, where each box is [x, y, z, l, w, h, yaw, score]
+    """
     B, _, H, W = pred_cls.shape
     stride = 4
     grid_size = CONFIG['grid_size'] * stride
@@ -626,36 +629,113 @@ def decode_predictions(pred_cls, pred_reg):
             cz = reg[2]
             l, w, h = torch.exp(reg[3]), torch.exp(reg[4]), torch.exp(reg[5])
             yaw = torch.atan2(reg[6], reg[7])
-            boxes.append([cx.item(), cy.item(), cz.item(), l.item(), w.item(), h.item(), yaw.item()])
+            
+            # Append box WITH score
+            boxes.append([cx.item(), cy.item(), cz.item(), l.item(), w.item(), h.item(), yaw.item(), topk_scores[i].item()])
         batch_boxes.append(boxes)
     return batch_boxes
 
 @torch.no_grad()
 def evaluate(model, loader):
-    """Calculates Recall, Precision, and F1 score."""
+    """
+    Calculates mAP (AP@2.0m), Precision, Recall, and F1.
+    """
     model.eval()
-    matches, total_gt, total_pred = 0, 0, 0
+    
+    # Storage for all predictions across the dataset
+    # List of dicts: {'score': float, 'is_tp': 0 or 1}
+    all_predictions = [] 
+    total_gt_objects = 0
+    
+    # Distance threshold for a True Positive (NuScenes standard-ish)
+    MATCH_DIST_THRESHOLD = 2.0 
+
     for batch in loader:
         pred_cls, pred_reg = model(batch)
         batch_boxes = decode_predictions(pred_cls, pred_reg)
         gt_box_list = batch['boxes']
         
         for b in range(len(batch_boxes)):
-            preds_box = batch_boxes[b]
-            gt_boxes = gt_box_list[b].numpy()
+            # 1. Get predictions and sort by confidence (Descending)
+            preds = batch_boxes[b] # [x, y, z, l, w, h, yaw, score]
+            preds.sort(key=lambda x: x[7], reverse=True)
             
-            total_gt += len(gt_boxes)
-            total_pred += len(preds_box)
-            if len(gt_boxes) > 0 and len(preds_box) > 0:
-                gt_xy = gt_boxes[:, :2]
-                pred_xy = np.array([p[:2] for p in preds_box])
-                dists = np.linalg.norm(gt_xy[:, None] - pred_xy[None, :], axis=2)
-                matches += np.any(dists < 2.0, axis=1).sum()
+            # 2. Get Ground Truth
+            gt_boxes = gt_box_list[b].numpy()
+            total_gt_objects += len(gt_boxes)
+            
+            # Keep track of which GT boxes have already been matched (Greedy matching)
+            gt_matched = np.zeros(len(gt_boxes), dtype=bool)
+            
+            # 3. Match Predictions to GT
+            for p in preds:
+                p_center = np.array(p[:2])
+                score = p[7]
                 
-    rec = matches / max(1, total_gt)
-    prec = matches / max(1, total_pred)
-    f1 = 2 * prec * rec / max(1e-6, prec + rec)
-    return rec, prec, f1
+                best_dist = float('inf')
+                best_gt_idx = -1
+                
+                # Find closest unmatched GT
+                if len(gt_boxes) > 0:
+                    dists = np.linalg.norm(gt_boxes[:, :2] - p_center, axis=1)
+                    # Sort by distance to find closest
+                    sorted_idxs = np.argsort(dists)
+                    
+                    for idx in sorted_idxs:
+                        if not gt_matched[idx]:
+                            best_dist = dists[idx]
+                            best_gt_idx = idx
+                            break
+                
+                # Determine if TP or FP
+                if best_dist < MATCH_DIST_THRESHOLD:
+                    gt_matched[best_gt_idx] = True
+                    all_predictions.append({'score': score, 'tp': 1})
+                else:
+                    all_predictions.append({'score': score, 'tp': 0})
+
+    # --- Compute Metrics ---
+    
+    if total_gt_objects == 0:
+        return 0.0, 0.0, 0.0
+
+    # Sort all predictions globally by score
+    all_predictions.sort(key=lambda x: x['score'], reverse=True)
+    
+    tps = np.array([x['tp'] for x in all_predictions])
+    fps = 1 - tps
+    
+    tp_cumsum = np.cumsum(tps)
+    fp_cumsum = np.cumsum(fps)
+    
+    recalls = tp_cumsum / total_gt_objects
+    precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
+    
+    # --- Calculate Average Precision (AP) ---
+    # We use the "All Points" interpolation method (Area Under Curve)
+    
+    # Pad with 0 and 1 for integration
+    mrec = np.concatenate(([0.0], recalls, [1.0]))
+    mpre = np.concatenate(([0.0], precisions, [0.0]))
+    
+    # Compute the precision envelope (ensure curve is monotonically decreasing)
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+        
+    # Calculate Area Under Curve
+    i = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
+
+    # Simple F1/Rec/Prec based on the final cumulative state (or best F1 point)
+    # Here we just return the values at the lowest confidence threshold used
+    final_rec = recalls[-1] if len(recalls) > 0 else 0
+    final_prec = precisions[-1] if len(precisions) > 0 else 0
+    final_f1 = 2 * final_prec * final_rec / max(1e-6, final_prec + final_rec)
+    
+    print(f"\nEvaluation Complete: {len(all_predictions)} Predictions vs {total_gt_objects} GTs")
+    print(f"mAP (AP@2.0m): {ap:.4f}")
+
+    return final_rec, final_prec, final_f1
 
 def train(model, loader, opt, scaler, epoch):
     """
