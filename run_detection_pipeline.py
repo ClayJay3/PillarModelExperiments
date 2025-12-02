@@ -578,21 +578,39 @@ def build_targets(gt_boxes, feature_shape, device):
     return hm, reg, mask
 
 def compute_loss(pred_cls, pred_reg, gt_cls, gt_reg, gt_mask):
-    """Focal Loss for Classification + L1 Loss for Regression."""
-    pos_inds = gt_cls.eq(1).float()
-    neg_weights = torch.pow(1 - gt_cls, 4)
-    pred_cls = torch.clamp(pred_cls, 1e-6, 1 - 1e-6)
-    
-    # Focal Loss (CenterNet variant)
-    pos_loss = torch.log(pred_cls) * torch.pow(1 - pred_cls, 2) * pos_inds
-    neg_loss = torch.log(1 - pred_cls) * torch.pow(pred_cls, 2) * neg_weights * gt_cls.lt(1).float()
-    loss_cls = - (pos_loss.sum() + neg_loss.sum()) / max(1, pos_inds.sum())
-    
-    # Regression Loss
+    eps = 1e-6
+    pred = torch.clamp(pred_cls, eps, 1.0 - eps)
+
+    # Focal loss parameters (CenterNet defaults)
+    alpha = 2.0
+    beta  = 4.0
+
+    # Masks
+    pos_mask = (gt_cls == 1).float()     
+    neg_mask = (gt_cls < 1).float()
+
+    num_pos = pos_mask.sum().clamp(min=1.0)
+
+    # Positive loss
+    pos_loss = -(pos_mask * ((1 - pred) ** alpha) * torch.log(pred)).sum()
+
+    # Negative loss
+    neg_weight = ((1 - gt_cls) ** beta)
+    neg_loss = -(neg_mask * (pred ** alpha) * torch.log(1 - pred + eps) * neg_weight).sum()
+
+    loss_cls = (pos_loss + neg_loss) / num_pos
+
+    # Regression loss 
     mask = gt_mask.expand_as(pred_reg).bool()
-    loss_reg = F.l1_loss(pred_reg[mask], gt_reg[mask], reduction='sum') / max(1, pos_inds.sum())
-    
-    return loss_cls + 2.0 * loss_reg
+    if mask.any():
+        loss_reg = F.l1_loss(pred_reg[mask], gt_reg[mask], reduction='sum') / num_pos
+    else:
+        loss_reg = torch.tensor(0.0, device=pred_reg.device)
+
+    return loss_cls + (1.0 * loss_reg)
+
+
+
 
 # --- Decoding & Eval ---
 
